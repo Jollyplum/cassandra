@@ -23,6 +23,7 @@ import java.util.EnumSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,8 +32,9 @@ import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.SystemKeyspace.BootstrapState;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.gms.FailureDetector;
-import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.IAsyncCallbackWithFailure;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
@@ -48,9 +50,12 @@ final class MigrationTask extends WrappedRunnable
 
     private final InetAddress endpoint;
 
-    MigrationTask(InetAddress endpoint)
+    private final AtomicInteger numTasksInFlight;
+
+    MigrationTask(InetAddress endpoint, AtomicInteger numTasksInFlight)
     {
         this.endpoint = endpoint;
+        this.numTasksInFlight = numTasksInFlight;
     }
 
     static ConcurrentLinkedQueue<CountDownLatch> getInflightTasks()
@@ -60,10 +65,30 @@ final class MigrationTask extends WrappedRunnable
 
     public void runMayThrow() throws Exception
     {
+        try
+        {
+            if (!maybeSubmitMigrationTask())
+                numTasksInFlight.decrementAndGet();
+        }
+        catch (Exception e)
+        {
+            numTasksInFlight.decrementAndGet();
+        }
+    }
+
+    /**
+     * We reference this method in a byteman based test see here: MigrationManagerTest
+     * Possibly submit a migration task if the endpoint is still alive and appropriate
+     * @return whether we actually sent a message to request schema
+     *
+     * @see      org.apache.cassandra.service.MigrationManagerTest
+     */
+    private boolean maybeSubmitMigrationTask()
+    {
         if (!FailureDetector.instance.isAlive(endpoint))
         {
             logger.warn("Can't send schema pull request: node {} is down.", endpoint);
-            return;
+            return false;
         }
 
         // There is a chance that quite some time could have passed between now and the MM#maybeScheduleSchemaPull(),
@@ -72,15 +97,16 @@ final class MigrationTask extends WrappedRunnable
         if (!MigrationManager.shouldPullSchemaFrom(endpoint))
         {
             logger.info("Skipped sending a migration request: node {} has a higher major version now.", endpoint);
-            return;
+            return false;
         }
 
         MessageOut message = new MessageOut<>(MessagingService.Verb.MIGRATION_REQUEST, null, MigrationManager.MigrationsSerializer.instance);
 
         final CountDownLatch completionLatch = new CountDownLatch(1);
 
-        IAsyncCallback<Collection<Mutation>> cb = new IAsyncCallback<Collection<Mutation>>()
+        IAsyncCallbackWithFailure<Collection<Mutation>> cb = new IAsyncCallbackWithFailure<Collection<Mutation>>()
         {
+
             @Override
             public void response(MessageIn<Collection<Mutation>> message)
             {
@@ -95,10 +121,23 @@ final class MigrationTask extends WrappedRunnable
                 finally
                 {
                     completionLatch.countDown();
+                    numTasksInFlight.decrementAndGet();
                 }
             }
 
+            public void onFailure(InetAddress from, RequestFailureReason failureReason)
+            {
+                // Whether the task succeeds or fails, we need to decrement the counter, or we may block future migrations
+                logger.warn("Migration task for {} failed", from.toString());
+                numTasksInFlight.decrementAndGet();
+            }
+
             public boolean isLatencyForSnitch()
+            {
+                return false;
+            }
+
+            public boolean supportsBackPressure()
             {
                 return false;
             }
@@ -108,6 +147,8 @@ final class MigrationTask extends WrappedRunnable
         if (monitoringBootstrapStates.contains(SystemKeyspace.getBootstrapState()))
             inflightTasks.offer(completionLatch);
 
-        MessagingService.instance().sendRR(message, endpoint, cb);
+        // Reference to this call made in byteman based test: MigrationManagerTest
+        MessagingService.instance().sendRRWithFailure(message, endpoint, cb);
+        return true;
     }
 }

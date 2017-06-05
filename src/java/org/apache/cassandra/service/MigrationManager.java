@@ -23,6 +23,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +64,14 @@ public class MigrationManager
 
     private final List<MigrationListener> listeners = new CopyOnWriteArrayList<>();
 
+    private static final int MAX_MIGRATION_TASKS_IN_FLIGHT = Integer.parseInt(System.getProperty("cassandra.migration.max_tasks_in_flight", "30"));
+    // How long to wait to expire the current limit after the last migration task which was submitted
+    private static final long MIGRATION_TASK_LIMIT_EXPIRY_TIME = Long.getLong("cassandra.migration.task_limit_expiry_time_ms", TimeUnit.MILLISECONDS.convert(5 * 60, TimeUnit.SECONDS));
+
+    static volatile AtomicInteger numTasksInFlight = new AtomicInteger(0);
+
+    private static volatile long lastSubmitted = 0;
+
     private MigrationManager() {}
 
     public void register(MigrationListener listener)
@@ -95,11 +104,23 @@ public class MigrationManager
             return;
         }
 
+        long elapsed = System.currentTimeMillis() - lastSubmitted;
+        if (Math.max(0, elapsed) > MIGRATION_TASK_LIMIT_EXPIRY_TIME)
+        {
+            logger.debug("Resetting non zero counter from value {} {} ms after it was last modified", numTasksInFlight.get(), elapsed);
+            numTasksInFlight = new AtomicInteger(0);
+        }
+        final int tasksInFlightNow = numTasksInFlight.get();
+        if (tasksInFlightNow >= MAX_MIGRATION_TASKS_IN_FLIGHT)
+        {
+            logger.debug("Not pulling schema because {} migration tasks in flight exceeds configured maximum of {}", tasksInFlightNow, MAX_MIGRATION_TASKS_IN_FLIGHT);
+            return;
+        }
+
         if (Schema.emptyVersion.equals(Schema.instance.getVersion()) || runtimeMXBean.getUptime() < MIGRATION_DELAY_IN_MS)
         {
             // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
-            logger.debug("Submitting migration task for {}", endpoint);
-            submitMigrationTask(endpoint);
+            submitMigrationTask(endpoint, numTasksInFlight);
         }
         else
         {
@@ -121,20 +142,30 @@ public class MigrationManager
                     logger.debug("not submitting migration task for {} because our versions match", endpoint);
                     return;
                 }
+                if (tasksInFlightNow >= MAX_MIGRATION_TASKS_IN_FLIGHT)
+                {
+                    logger.debug("Not pulling schema because {} migration tasks in flight exceeds configured maximum of {}", tasksInFlightNow, MAX_MIGRATION_TASKS_IN_FLIGHT);
+                    return;
+                }
+
                 logger.debug("submitting migration task for {}", endpoint);
-                submitMigrationTask(endpoint);
+                submitMigrationTask(endpoint, numTasksInFlight);
             };
             ScheduledExecutors.nonPeriodicTasks.schedule(runnable, MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
         }
     }
 
-    private static Future<?> submitMigrationTask(InetAddress endpoint)
+    private static Future<?> submitMigrationTask(InetAddress endpoint, AtomicInteger numTasksInFlight)
     {
+
+        logger.debug("Submitting migration task for {}", endpoint);
+        numTasksInFlight.incrementAndGet();
+        lastSubmitted = System.currentTimeMillis();
         /*
          * Do not de-ref the future because that causes distributed deadlock (CASSANDRA-3832) because we are
          * running in the gossip stage.
          */
-        return StageManager.getStage(Stage.MIGRATION).submit(new MigrationTask(endpoint));
+        return StageManager.getStage(Stage.MIGRATION).submit(new MigrationTask(endpoint, numTasksInFlight));
     }
 
     public static boolean shouldPullSchemaFrom(InetAddress endpoint)
@@ -613,7 +644,7 @@ public class MigrationManager
             if (shouldPullSchemaFrom(node))
             {
                 logger.debug("Requesting schema from {}", node);
-                FBUtilities.waitOnFuture(submitMigrationTask(node));
+                FBUtilities.waitOnFuture(submitMigrationTask(node, numTasksInFlight));
                 break;
             }
         }

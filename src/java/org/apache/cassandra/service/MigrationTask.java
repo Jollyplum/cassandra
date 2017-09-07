@@ -17,17 +17,20 @@
  */
 package org.apache.cassandra.service;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.SystemKeyspace.BootstrapState;
@@ -87,6 +90,7 @@ class MigrationTask extends WrappedRunnable
             @Override
             public void response(MessageIn<Collection<Mutation>> message)
             {
+                UUID priorVersion = Schema.instance.getVersion();
                 try
                 {
                     SchemaKeyspace.mergeSchemaAndAnnounceVersion(message.payload);
@@ -98,6 +102,11 @@ class MigrationTask extends WrappedRunnable
                 finally
                 {
                     completionLatch.countDown();
+                    UUID resultantVersion = Schema.instance.getVersion();
+                    Set<UUID> seenSchemaVersions = Stream.of(priorVersion, resultantVersion).collect(Collectors.toSet());
+                    for (UUID schemaVersion : seenSchemaVersions) {
+                        MigrationManager.instance.clearVersion(schemaVersion);
+                    }
                 }
             }
 

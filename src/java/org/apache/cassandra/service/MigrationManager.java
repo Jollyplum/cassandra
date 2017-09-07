@@ -23,9 +23,15 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
+import com.google.common.collect.Multimaps;
+import com.google.common.collect.SetMultimap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
@@ -53,17 +59,106 @@ public class MigrationManager
 {
     private static final Logger logger = LoggerFactory.getLogger(MigrationManager.class);
 
-    public static final MigrationManager instance = new MigrationManager();
+    public static final MigrationManager instance = new MigrationManager(Multimaps.newSetMultimap(new ConcurrentHashMap<>(), ConcurrentHashMap::newKeySet), new ConcurrentHashMap<>());
 
     private static final RuntimeMXBean runtimeMXBean = ManagementFactory.getRuntimeMXBean();
 
-    public static final int MIGRATION_DELAY_IN_MS = 60000;
+    private static final int MIGRATION_DELAY_IN_MS = Integer.parseInt(System.getProperty("cassandra.migration_delay_in_ms", "60000"));
+    private static final int RECENTLY_STARTED_UPTIME_IN_MS = Integer.parseInt(System.getProperty("cassandra.recently_started_uptime_in_ms", "60000"));
+    private static final int SCHEMA_VERSION_TASK_INTERVAL_IN_MS = Integer.parseInt(System.getProperty("cassandra.schema_version_task_interval_in_ms", "1000"));
 
     private static final int MIGRATION_TASK_WAIT_IN_SECONDS = Integer.parseInt(System.getProperty("cassandra.migration_task_wait_in_seconds", "1"));
 
     private final List<MigrationListener> listeners = new CopyOnWriteArrayList<>();
 
-    private MigrationManager() {}
+    private final SetMultimap<UUID, InetAddress> schemaVersionEndpoints;
+    private final ConcurrentHashMap<InetAddress, AtomicReference<UUID>> schemaVersions;
+
+    private volatile boolean schemaVersionConvergenceTaskStarted = false;
+
+    public MigrationManager(SetMultimap<UUID, InetAddress> schemaVersionEndpoints, ConcurrentHashMap<InetAddress, AtomicReference<UUID>> schemaVersions)
+    {
+        this.schemaVersionEndpoints = schemaVersionEndpoints;
+        this.schemaVersions = schemaVersions;
+    }
+
+    /**
+     * Evaluates whether any other endpoints have a differing schema version
+     * and if so randomly picks a schema version and a representative node to submit a migration task for.
+     *
+     */
+    private void schemaVersionConvergence()
+    {
+        logger.debug("Running schema version convergence task");
+        List<UUID> otherSchemaVersions = schemaVersionEndpoints.keySet().stream()
+                                                               .filter(x -> !x.equals(Schema.instance.getVersion()))
+                                                               .collect(Collectors.toList());
+        if (!otherSchemaVersions.isEmpty())
+        {
+            logger.debug("Other schema versions detected: {}", otherSchemaVersions);
+            int numVersions = otherSchemaVersions.size();
+            int idx = ThreadLocalRandom.current().nextInt(numVersions);
+            List<InetAddress> endpointsWithVersion = new ArrayList<>();
+            for (int i = 0; i < numVersions; i++)
+            {
+                endpointsWithVersion = schemaVersionEndpoints.get(otherSchemaVersions.get((i + idx) % numVersions)).stream()
+                                                             .filter(FailureDetector.instance::isAlive)
+                                                             .collect(Collectors.toList());
+                if (!endpointsWithVersion.isEmpty())
+                {
+                    break;
+                }
+            }
+
+            if (endpointsWithVersion.isEmpty())
+            {
+                logger.warn("other schema versions detected but unable to find suitable endpoints to pull from");
+            }
+            else
+            {
+                InetAddress endpoint = endpointsWithVersion.get(ThreadLocalRandom.current().nextInt(endpointsWithVersion.size()));
+                if (runtimeMXBean.getUptime() < RECENTLY_STARTED_UPTIME_IN_MS || Schema.emptyVersion.equals(Schema.instance.getVersion()))
+                {
+                    // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
+                    logger.debug("Submitting migration task for {}", endpoint);
+                    submitMigrationTask(endpoint);
+                }
+                else
+                {
+                    ScheduledExecutors.nonPeriodicTasks.schedule(delayedSchemaMigrationTask(endpoint), MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
+                }
+            }
+        }
+        else
+        {
+            logger.debug("Did not find any nodes with schema version differing");
+        }
+    }
+
+    private Runnable delayedSchemaMigrationTask(InetAddress endpoint)
+    {
+        // Include a delay to make sure we have a chance to apply any changes being
+        // pushed out simultaneously. See CASSANDRA-5025
+        return () ->
+        {
+            // grab the latest version of the schema since it may have changed again since the initial scheduling
+            EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
+            if (epState == null)
+            {
+                logger.debug("epState vanished for {}, not submitting migration task", endpoint);
+                return;
+            }
+            VersionedValue value = epState.getApplicationState(ApplicationState.SCHEMA);
+            UUID currentVersion = UUID.fromString(value.value);
+            if (Schema.instance.getVersion().equals(currentVersion))
+            {
+                logger.debug("not submitting migration task for {} because our versions match", endpoint);
+                return;
+            }
+            logger.debug("submitting migration task for {}", endpoint);
+            submitMigrationTask(endpoint);
+        };
+    }
 
     public void register(MigrationListener listener)
     {
@@ -75,58 +170,62 @@ public class MigrationManager
         listeners.remove(listener);
     }
 
-    public static void scheduleSchemaPull(InetAddress endpoint, EndpointState state)
+    void updateSchemaVersionMap(InetAddress endpoint, EndpointState state)
     {
+        maybeStartSchemaVersionConvergence(ScheduledExecutors.scheduledTasks);
+
         VersionedValue value = state.getApplicationState(ApplicationState.SCHEMA);
 
         if (!endpoint.equals(FBUtilities.getBroadcastAddress()) && value != null)
-            maybeScheduleSchemaPull(UUID.fromString(value.value), endpoint);
-    }
-
-    /**
-     * If versions differ this node sends request with local migration list to the endpoint
-     * and expecting to receive a list of migrations to apply locally.
-     */
-    private static void maybeScheduleSchemaPull(final UUID theirVersion, final InetAddress endpoint)
-    {
-        if ((Schema.instance.getVersion() != null && Schema.instance.getVersion().equals(theirVersion)) || !shouldPullSchemaFrom(endpoint))
         {
-            logger.debug("Not pulling schema because versions match or shouldPullSchemaFrom returned false");
-            return;
-        }
-
-        if (Schema.emptyVersion.equals(Schema.instance.getVersion()) || runtimeMXBean.getUptime() < MIGRATION_DELAY_IN_MS)
-        {
-            // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
-            logger.debug("Submitting migration task for {}", endpoint);
-            submitMigrationTask(endpoint);
-        }
-        else
-        {
-            // Include a delay to make sure we have a chance to apply any changes being
-            // pushed out simultaneously. See CASSANDRA-5025
-            Runnable runnable = () ->
+            UUID newUUID = UUID.fromString(value.value);
+            AtomicReference<UUID> previousRef = schemaVersions.putIfAbsent(endpoint, new AtomicReference<>(newUUID));
+            if (previousRef != null)
             {
-                // grab the latest version of the schema since it may have changed again since the initial scheduling
-                EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-                if (epState == null)
+                UUID previousUUID = previousRef.get();
+                while (!previousRef.compareAndSet(previousUUID, newUUID))
                 {
-                    logger.debug("epState vanished for {}, not submitting migration task", endpoint);
-                    return;
+                    previousUUID = previousRef.get();
                 }
-                VersionedValue value = epState.getApplicationState(ApplicationState.SCHEMA);
-                UUID currentVersion = UUID.fromString(value.value);
-                if (Schema.instance.getVersion().equals(currentVersion))
-                {
-                    logger.debug("not submitting migration task for {} because our versions match", endpoint);
-                    return;
-                }
-                logger.debug("submitting migration task for {}", endpoint);
-                submitMigrationTask(endpoint);
-            };
-            ScheduledExecutors.nonPeriodicTasks.schedule(runnable, MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
+                schemaVersionEndpoints.remove(previousUUID, endpoint);
+            }
+            schemaVersionEndpoints.put(newUUID, endpoint);
         }
     }
+
+    private void maybeStartSchemaVersionConvergence(final DebuggableScheduledThreadPoolExecutor executor)
+    {
+        if (!schemaVersionConvergenceTaskStarted)
+        {
+            synchronized (this)
+            {
+                if (!schemaVersionConvergenceTaskStarted)
+                {
+                    executor.scheduleWithFixedDelay(
+                    () ->
+                    {
+                        try
+                        {
+                            schemaVersionConvergence();
+                        }
+                        catch (Throwable t)
+                        {
+                            logger.error("Problem running schema version convergence", t);
+                        }
+                    },
+                    0, SCHEMA_VERSION_TASK_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+
+                    schemaVersionConvergenceTaskStarted = true;
+                }
+            }
+        }
+    }
+
+    void clearVersion(UUID schemaVesion)
+    {
+        schemaVersionEndpoints.removeAll(schemaVesion);
+    }
+
 
     private static Future<?> submitMigrationTask(InetAddress endpoint)
     {
@@ -144,8 +243,8 @@ public class MigrationManager
          * Don't request schema from fat clients
          */
         return MessagingService.instance().knowsVersion(endpoint)
-                && is30Compatible(MessagingService.instance().getRawVersion(endpoint))
-                && !Gossiper.instance.isGossipOnlyMember(endpoint);
+               && is30Compatible(MessagingService.instance().getRawVersion(endpoint))
+               && !Gossiper.instance.isGossipOnlyMember(endpoint);
     }
 
     // Since 3.0.14 protocol contains only a CASSANDRA-13004 bugfix, it is safe to accept schema changes
@@ -326,7 +425,7 @@ public class MigrationManager
      * a system table schema (Note that we don't know if the schema we force _is_ the most recent version or not, we
      * just rely on idempotency to basically ignore that announce if it's not. That's why we can't use announceUpdateColumnFamily,
      * it would for instance delete new columns if this is not called with the most up-to-date version)
-     *
+     * <p>
      * Note that this is only safe for system tables where we know the cfId is fixed and will be the same whatever version
      * of the definition is used.
      */
@@ -347,7 +446,7 @@ public class MigrationManager
         KeyspaceMetadata ksm = Schema.instance.getKSMetaData(cfm.ksName);
         if (ksm == null)
             throw new ConfigurationException(String.format("Cannot add table '%s' to non existing keyspace '%s'.", cfm.cfName, cfm.ksName));
-        // If we have a table or a view which has the same name, we can't add a new one
+            // If we have a table or a view which has the same name, we can't add a new one
         else if (throwOnDuplicate && ksm.getTableOrViewNullable(cfm.cfName) != null)
             throw new AlreadyExistsException(cfm.ksName, cfm.cfName);
 
@@ -535,6 +634,7 @@ public class MigrationManager
 
     /**
      * actively announce a new version to active hosts via rpc
+     *
      * @param schema The schema mutation to be applied
      */
     private static void announce(Mutation schema, boolean announceLocally)

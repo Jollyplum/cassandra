@@ -24,14 +24,18 @@ import java.util.concurrent.*;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Multimaps;
 import com.google.common.collect.SetMultimap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.LocalAwareExecutorService;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
@@ -59,7 +63,8 @@ public class MigrationManager
 {
     private static final Logger logger = LoggerFactory.getLogger(MigrationManager.class);
 
-    public static final MigrationManager instance = new MigrationManager(Multimaps.newSetMultimap(new ConcurrentHashMap<>(), ConcurrentHashMap::newKeySet), new ConcurrentHashMap<>());
+    public static final MigrationManager instance = new MigrationManager(Multimaps.newSetMultimap(new ConcurrentHashMap<>(), ConcurrentHashMap::newKeySet),
+                                                                         new ConcurrentHashMap<>(), ThreadLocalRandom::current, FailureDetector.instance::isAlive);
 
     private static final RuntimeMXBean runtimeMXBean = ManagementFactory.getRuntimeMXBean();
 
@@ -73,21 +78,40 @@ public class MigrationManager
 
     private final SetMultimap<UUID, InetAddress> schemaVersionEndpoints;
     private final ConcurrentHashMap<InetAddress, AtomicReference<UUID>> schemaVersions;
+    private final Supplier<Random> randomProvider;
 
     private volatile boolean schemaVersionConvergenceTaskStarted = false;
+    private final Predicate<InetAddress> isAliveCheck;
 
-    public MigrationManager(SetMultimap<UUID, InetAddress> schemaVersionEndpoints, ConcurrentHashMap<InetAddress, AtomicReference<UUID>> schemaVersions)
+    public MigrationManager(SetMultimap<UUID, InetAddress> schemaVersionEndpoints,
+                            ConcurrentHashMap<InetAddress, AtomicReference<UUID>> schemaVersions,
+                            Supplier<Random> randomProvider, Predicate<InetAddress> isAliveCheck)
     {
         this.schemaVersionEndpoints = schemaVersionEndpoints;
         this.schemaVersions = schemaVersions;
+        this.randomProvider = randomProvider;
+        this.isAliveCheck = isAliveCheck;
+    }
+
+    public void register(MigrationListener listener)
+    {
+        listeners.add(listener);
+    }
+
+    public void unregister(MigrationListener listener)
+    {
+        listeners.remove(listener);
     }
 
     /**
      * Evaluates whether any other endpoints have a differing schema version
      * and if so randomly picks a schema version and a representative node to submit a migration task for.
      *
+     * @param nonPeriodicTasks threadpool to schedule the delayed runnable on before submitting to migrationStage
+     * @param migrationStage migration stage exposed for testing.
      */
-    private void schemaVersionConvergence()
+    @VisibleForTesting
+    void schemaVersionConvergence(final DebuggableScheduledThreadPoolExecutor nonPeriodicTasks, final LocalAwareExecutorService migrationStage)
     {
         logger.debug("Running schema version convergence task");
         List<UUID> otherSchemaVersions = schemaVersionEndpoints.keySet().stream()
@@ -97,12 +121,12 @@ public class MigrationManager
         {
             logger.debug("Other schema versions detected: {}", otherSchemaVersions);
             int numVersions = otherSchemaVersions.size();
-            int idx = ThreadLocalRandom.current().nextInt(numVersions);
+            int idx = randomProvider.get().nextInt(numVersions);
             List<InetAddress> endpointsWithVersion = new ArrayList<>();
             for (int i = 0; i < numVersions; i++)
             {
                 endpointsWithVersion = schemaVersionEndpoints.get(otherSchemaVersions.get((i + idx) % numVersions)).stream()
-                                                             .filter(FailureDetector.instance::isAlive)
+                                                             .filter(isAliveCheck)
                                                              .collect(Collectors.toList());
                 if (!endpointsWithVersion.isEmpty())
                 {
@@ -116,16 +140,16 @@ public class MigrationManager
             }
             else
             {
-                InetAddress endpoint = endpointsWithVersion.get(ThreadLocalRandom.current().nextInt(endpointsWithVersion.size()));
+                InetAddress endpoint = endpointsWithVersion.get(randomProvider.get().nextInt(endpointsWithVersion.size()));
                 if (runtimeMXBean.getUptime() < RECENTLY_STARTED_UPTIME_IN_MS || Schema.emptyVersion.equals(Schema.instance.getVersion()))
                 {
                     // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
                     logger.debug("Submitting migration task for {}", endpoint);
-                    submitMigrationTask(endpoint);
+                    submitMigrationTask(endpoint, migrationStage, isAliveCheck);
                 }
                 else
                 {
-                    ScheduledExecutors.nonPeriodicTasks.schedule(delayedSchemaMigrationTask(endpoint), MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
+                    nonPeriodicTasks.schedule(delayedSchemaMigrationTask(endpoint, migrationStage), MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
                 }
             }
         }
@@ -135,7 +159,7 @@ public class MigrationManager
         }
     }
 
-    private Runnable delayedSchemaMigrationTask(InetAddress endpoint)
+    private Runnable delayedSchemaMigrationTask(InetAddress endpoint, LocalAwareExecutorService migrationStage)
     {
         // Include a delay to make sure we have a chance to apply any changes being
         // pushed out simultaneously. See CASSANDRA-5025
@@ -156,24 +180,52 @@ public class MigrationManager
                 return;
             }
             logger.debug("submitting migration task for {}", endpoint);
-            submitMigrationTask(endpoint);
+            submitMigrationTask(endpoint, migrationStage, isAliveCheck);
         };
     }
 
-    public void register(MigrationListener listener)
-    {
-        listeners.add(listener);
-    }
-
-    public void unregister(MigrationListener listener)
-    {
-        listeners.remove(listener);
-    }
-
-    void updateSchemaVersionMap(InetAddress endpoint, EndpointState state)
+    void notifySchemaVersion(InetAddress endpoint, EndpointState state)
     {
         maybeStartSchemaVersionConvergence(ScheduledExecutors.scheduledTasks);
 
+        updateSchemaVersionMap(endpoint, state);
+    }
+
+    private void maybeStartSchemaVersionConvergence(final DebuggableScheduledThreadPoolExecutor executor)
+    {
+        if (!schemaVersionConvergenceTaskStarted)
+        {
+            synchronized (this)
+            {
+                if (!schemaVersionConvergenceTaskStarted)
+                {
+                    executor.scheduleWithFixedDelay(
+                    () ->
+                    {
+                        try
+                        {
+                            schemaVersionConvergence(ScheduledExecutors.nonPeriodicTasks, StageManager.getStage(Stage.MIGRATION));
+                        }
+                        catch (Throwable t)
+                        {
+                            logger.error("Problem running schema version convergence", t);
+                        }
+                    },
+                    0, SCHEMA_VERSION_TASK_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+
+                    schemaVersionConvergenceTaskStarted = true;
+                }
+            }
+        }
+    }
+
+    void clearVersion(UUID schemaVesion)
+    {
+        schemaVersionEndpoints.removeAll(schemaVesion);
+    }
+    @VisibleForTesting
+    void updateSchemaVersionMap(InetAddress endpoint, EndpointState state)
+    {
         VersionedValue value = state.getApplicationState(ApplicationState.SCHEMA);
 
         if (!endpoint.equals(FBUtilities.getBroadcastAddress()) && value != null)
@@ -193,47 +245,19 @@ public class MigrationManager
         }
     }
 
-    private void maybeStartSchemaVersionConvergence(final DebuggableScheduledThreadPoolExecutor executor)
-    {
-        if (!schemaVersionConvergenceTaskStarted)
-        {
-            synchronized (this)
-            {
-                if (!schemaVersionConvergenceTaskStarted)
-                {
-                    executor.scheduleWithFixedDelay(
-                    () ->
-                    {
-                        try
-                        {
-                            schemaVersionConvergence();
-                        }
-                        catch (Throwable t)
-                        {
-                            logger.error("Problem running schema version convergence", t);
-                        }
-                    },
-                    0, SCHEMA_VERSION_TASK_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-
-                    schemaVersionConvergenceTaskStarted = true;
-                }
-            }
-        }
-    }
-
-    void clearVersion(UUID schemaVesion)
-    {
-        schemaVersionEndpoints.removeAll(schemaVesion);
-    }
-
 
     private static Future<?> submitMigrationTask(InetAddress endpoint)
+    {
+        return instance.submitMigrationTask(endpoint, StageManager.getStage(Stage.MIGRATION), FailureDetector.instance::isAlive);
+    }
+
+    private Future<?> submitMigrationTask(InetAddress endpoint, final LocalAwareExecutorService migrationStage, Predicate<InetAddress> isAliveCheck)
     {
         /*
          * Do not de-ref the future because that causes distributed deadlock (CASSANDRA-3832) because we are
          * running in the gossip stage.
          */
-        return StageManager.getStage(Stage.MIGRATION).submit(new MigrationTask(endpoint));
+        return migrationStage.submit(new MigrationTask(endpoint, isAliveCheck));
     }
 
     public static boolean shouldPullSchemaFrom(InetAddress endpoint)

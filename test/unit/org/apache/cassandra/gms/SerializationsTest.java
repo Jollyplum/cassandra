@@ -111,6 +111,11 @@ public class SerializationsTest extends AbstractSerializationsTester
         in.close();
     }
 
+    public static EndpointState getEndpointState(final int gen, final int ver)
+    {
+        return new EndpointState(new HeartBeatState(gen, ver));
+    }
+
     private static class Statics
     {
         private static HeartBeatState HeartbeatSt = new HeartBeatState(101, 201);

@@ -26,6 +26,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.function.Predicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,7 +36,6 @@ import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.SystemKeyspace.BootstrapState;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.net.IAsyncCallback;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
@@ -53,10 +53,12 @@ class MigrationTask extends WrappedRunnable
     private static final Set<BootstrapState> monitoringBootstrapStates = EnumSet.of(BootstrapState.NEEDS_BOOTSTRAP, BootstrapState.IN_PROGRESS);
 
     private final InetAddress endpoint;
+    private final Predicate<InetAddress> aliveCheck;
 
-    MigrationTask(InetAddress endpoint)
+    MigrationTask(InetAddress endpoint, Predicate<InetAddress> isAlive)
     {
         this.endpoint = endpoint;
+        this.aliveCheck = isAlive;
     }
 
     public static ConcurrentLinkedQueue<CountDownLatch> getInflightTasks()
@@ -66,7 +68,7 @@ class MigrationTask extends WrappedRunnable
 
     public void runMayThrow() throws Exception
     {
-        if (!FailureDetector.instance.isAlive(endpoint))
+        if (!aliveCheck.test(endpoint))
         {
             logger.warn("Can't send schema pull request: node {} is down.", endpoint);
             return;

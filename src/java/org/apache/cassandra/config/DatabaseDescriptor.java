@@ -3735,6 +3735,16 @@ public class DatabaseDescriptor
         conf.transfer_hints_on_decommission = enabled;
     }
 
+    public static boolean isHintTtlUseMutationCreationTime()
+    {
+        return conf.hint_ttl_use_mutation_creation_time;
+    }
+
+    public static void setHintTtlUseMutationCreationTime(boolean enabled)
+    {
+        conf.hint_ttl_use_mutation_creation_time = enabled;
+    }
+
     public static boolean isIncrementalBackupsEnabled()
     {
         return conf.incremental_backups;

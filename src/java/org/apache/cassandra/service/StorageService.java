@@ -6036,8 +6036,18 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         logger.info("updated transfer_hints_on_decommission to {}", enabled);
     }
 
-    public void setHintedHandoffThrottleInKB(int throttleInKB)
+    public boolean isHintTtlUseMutationCreationTime()
     {
+        return DatabaseDescriptor.isHintTtlUseMutationCreationTime();
+    }
+
+    public void setHintTtlUseMutationCreationTime(boolean enabled)
+    {
+        DatabaseDescriptor.setHintTtlUseMutationCreationTime(enabled);
+        logger.info("updated hint_ttl_use_mutation_creation_time to {}", enabled);
+    }
+
+    public void setHintedHandoffThrottleInKB(int throttleInKB) {
         DatabaseDescriptor.setHintedHandoffThrottleInKB(throttleInKB);
         logger.info("updated hinted_handoff_throttle_in_kb to {}", throttleInKB);
     }

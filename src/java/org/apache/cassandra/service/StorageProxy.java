@@ -150,6 +150,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 import static com.google.common.collect.Iterables.concat;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 import static org.apache.commons.lang3.StringUtils.join;
 
 import static org.apache.cassandra.db.ConsistencyLevel.SERIAL;
@@ -2745,8 +2746,13 @@ public class StorageProxy implements StorageProxyMBean
                     else
                         logger.debug("Discarding hint for endpoint not part of ring: {}", target);
                 }
-                logger.trace("Adding hints for {}", validTargets);
-                HintsService.instance.write(hostIds, Hint.create(mutation, currentTimeMillis()));
+
+                long creationTime = currentTimeMillis();
+                if (DatabaseDescriptor.isHintTtlUseMutationCreationTime()) {
+                    creationTime -= TimeUnit.MILLISECONDS.convert(Math.abs(approxTime.now() - mutation.getApproxCreatedAtNanos()), NANOSECONDS);
+                }
+                logger.trace("Adding hints for {} with creation time {} ms", validTargets, creationTime);
+                HintsService.instance.write(hostIds, Hint.create(mutation,  creationTime));
                 validTargets.forEach(HintsService.instance.metrics::incrCreatedHints);
                 // Notify the handler only for CL == ANY
                 if (responseHandler != null && responseHandler.replicaPlan.consistencyLevel() == ConsistencyLevel.ANY)

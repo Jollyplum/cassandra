@@ -46,7 +46,7 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
-public class HintsMaxWindowTest extends TestBaseImpl
+public class HintsMaxWindowTest extends AbstractHintWindowTest
 {
     @Test
     public void testHintsKeepRecordingAfterNodeGoesOfflineRepeatedly() throws Exception
@@ -113,76 +113,4 @@ public class HintsMaxWindowTest extends TestBaseImpl
         }
     }
 
-    private void waitUntilNoHints(IInvokableInstance node1, UUID node2UUID)
-    {
-        await().pollInterval(10, SECONDS)
-               .timeout(1, MINUTES)
-               .until(() -> getTotalHintsSize(node1, node2UUID) == 0);
-    }
-
-    private Long getTotalHintsSize(IInvokableInstance node, UUID node2UUID)
-    {
-        return node.appliesOnInstance((IIsolatedExecutor.SerializableFunction<UUID, Long>) secondNode -> {
-            return HintsService.instance.getTotalHintsSize(secondNode);
-        }).apply(node2UUID);
-    }
-
-    private void waitUntilNodeState(IInvokableInstance node, UUID node2UUID, boolean shouldBeOnline)
-    {
-        await().pollInterval(10, SECONDS)
-               .timeout(1, MINUTES)
-               .until(() -> node.appliesOnInstance((IIsolatedExecutor.SerializableBiFunction<UUID, Boolean, Boolean>) (secondNode, online) -> {
-                   InetAddressAndPort address = StorageService.instance.getEndpointForHostId(secondNode);
-                   return online == FailureDetector.instance.isAlive(address);
-               }).apply(node2UUID, shouldBeOnline));
-    }
-
-
-    private Long getTotalHintsCount(IInvokableInstance node)
-    {
-        return node.callOnInstance(() -> StorageMetrics.totalHints.getCount());
-    }
-
-    private void assertHintsSizes(IInvokableInstance node, UUID node2UUID)
-    {
-        // we indeed have some hints in its dir
-        File hintsDir = new File(node.config().getString("hints_directory"));
-        assertThat(FileUtils.folderSize(hintsDir)).isPositive();
-
-        // and there is positive size of hints on the disk for the second node
-        long totalHintsSize = node.appliesOnInstance((IIsolatedExecutor.SerializableFunction<UUID, Long>) secondNode -> {
-            return HintsService.instance.getTotalHintsSize(secondNode);
-        }).apply(node2UUID);
-
-        Assertions.assertThat(totalHintsSize).isPositive();
-    }
-
-    private Long insertData(final Cluster cluster)
-    {
-        // insert data and sleep every 10k to have a chance to flush hints
-        for (int i = 0; i < 70000; i++)
-        {
-            cluster.coordinator(1)
-                   .execute(withKeyspace("INSERT INTO %s.cf (k, c1) VALUES (?, ?);"),
-                            ONE, UUID.randomUUID().toString(), UUID.randomUUID().toString());
-
-            if (i % 10000 == 0)
-                await().atLeast(2, SECONDS).pollDelay(2, SECONDS).until(() -> true);
-        }
-
-        await().atLeast(3, SECONDS).pollDelay(3, SECONDS).until(() -> true);
-
-        // we see that metrics are updated
-
-        await().until(() -> cluster.get(1).callOnInstance(() -> StorageMetrics.totalHints.getCount()) > 0);
-        return cluster.get(1).callOnInstance(() -> StorageMetrics.totalHints.getCount());
-    }
-
-    private static void waitForExistingRoles(Cluster cluster)
-    {
-        cluster.forEach(instance -> await().pollDelay(1, SECONDS)
-                                           .pollInterval(1, SECONDS)
-                                           .atMost(60, SECONDS)
-                                           .until(() -> instance.callOnInstance(CassandraRoleManager::hasExistingRoles)));
-    }
 }

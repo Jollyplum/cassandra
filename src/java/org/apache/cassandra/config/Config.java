@@ -300,7 +300,7 @@ public class Config
     public int max_hints_file_size_in_mb = 128;
     public ParameterizedClass hints_compression;
     public volatile boolean transfer_hints_on_decommission = true;
-    public volatile boolean hint_ttl_use_mutation_creation_time = true;
+    public volatile boolean use_creation_time_for_hint_ttl = true;
 
     public volatile boolean incremental_backups = false;
     public boolean trickle_fsync = false;

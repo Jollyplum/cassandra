@@ -139,6 +139,7 @@ import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
 import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.gms.TokenSerializer;
 import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.hints.Hint;
 import org.apache.cassandra.hints.HintsService;
 import org.apache.cassandra.io.sstable.SSTableLoader;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
@@ -6036,11 +6037,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         logger.info("updated transfer_hints_on_decommission to {}", enabled);
     }
 
+    @Override
     public boolean isHintTtlUseMutationCreationTime()
     {
         return DatabaseDescriptor.isUseCreationTimeForHintTtl();
     }
 
+    @Override
     public void setUseCreationTimeForHintTtl(boolean enabled)
     {
         DatabaseDescriptor.setUseCreationTimeForHintTtl(enabled);
@@ -6050,6 +6053,19 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public void setHintedHandoffThrottleInKB(int throttleInKB) {
         DatabaseDescriptor.setHintedHandoffThrottleInKB(throttleInKB);
         logger.info("updated hinted_handoff_throttle_in_kb to {}", throttleInKB);
+    }
+
+    @Override
+    public int getMaxHintTTL()
+    {
+        return Hint.maxHintTTL;
+    }
+
+    @Override
+    public void setMaxHintTTL(int maxHintTTL)
+    {
+        Hint.maxHintTTL = maxHintTTL;
+        logger.info("updated Hint.maxHintTTL to {}", maxHintTTL);
     }
 
     @Override

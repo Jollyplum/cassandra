@@ -2432,8 +2432,10 @@ public class StorageProxy implements StorageProxyMBean
                 }
 
                 long creationTime = System.currentTimeMillis();
-                if (DatabaseDescriptor.isUseCreationTimeForHintTtl()) {
-                    creationTime -= TimeUnit.MILLISECONDS.convert(Math.abs(approxTime.now() - mutation.getApproxCreatedAtNanos()), NANOSECONDS);
+                if (DatabaseDescriptor.isUseCreationTimeForHintTtl())
+                {
+                    long mutationCreationTimeNanos = responseHandler != null ? responseHandler.getQueryStartNanoTime() : mutation.getApproxCreatedAtNanos();
+                    creationTime -= TimeUnit.MILLISECONDS.convert(Math.max(0, approxTime.now() - mutationCreationTimeNanos), NANOSECONDS);
                 }
                 logger.trace("Adding hints for {} with creation time {} ms", validTargets, creationTime);
                 HintsService.instance.write(hostIds, Hint.create(mutation,  creationTime));

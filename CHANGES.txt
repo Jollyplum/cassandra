@@ -1,4 +1,5 @@
 4.0.16
+ * Make hint expiry use request start time rather than timeout time for TTL (CASSANDRA-20014)
  * Fix gossip issue with gossip-only and bootstrapping nodes missing DC/Rack/Host ID endpoint state (CASSANDRA-19983)
 
 
